@@ -2189,8 +2189,8 @@ def test_tokens_file_rebrands_the_generation_task(
 ) -> None:
     """A tokens file at the conventional path in the task owner's Files
     re-brands the generated nextcloud theme: the render receives the
-    token colors and font, the instance's own branding (its background
-    photo included) is cleared, and an INFO line names the file."""
+    token colors and font while the instance background photo survives
+    under them, and an INFO line names the file."""
     fake, _calls = nc_deck_scheduler()
     monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
     nc, api = make_fake_nc(
@@ -2214,7 +2214,9 @@ def test_tokens_file_rebrands_the_generation_task(
     assert values.color == "#3a1b5d"
     assert values.color_text == "#f5f0e8"
     assert values.font_family == "IBM Plex Sans"
-    assert values.background == ""  # the instance photo did not survive
+    # the instance photo survives the overlay: tokens steer colors and
+    # font, the image composes under a scrim of the token color
+    assert values.background == NC_THEMING_CAPS["background"]
     assert any(
         "design tokens file" in r.getMessage() and TOKENS_PATH in r.getMessage()
         for r in caplog.records
@@ -2478,7 +2480,9 @@ def test_per_slide_gate_measures_the_token_branded_theme(monkeypatch, settings) 
         assert isinstance(values, ThemingValues)
         assert values.color == "#3a1b5d"
         assert values.font_family == "IBM Plex Sans"
-        assert values.background == ""
+        # the image survives the overlay: the gate measures the composed
+        # theme (token colors over the instance photo), not a flat one
+        assert values.background == NC_THEMING_CAPS["background"]
 
 
 def test_tokens_lookup_runs_impersonated_and_without_userid_degrades(

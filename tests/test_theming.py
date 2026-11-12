@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import base64
 import email.message
+import logging
 import re
 import urllib.request
 from dataclasses import replace as _replace
+
+import pytest
 
 from marp_slides.theming import (
     _SCRIM_ALPHA_WINDOW,
@@ -329,6 +332,59 @@ def test_scrim_neutral_fallback_for_pathological_branding() -> None:
     alpha, tint = _scrim_alpha("#777777", "#101010")
     assert tint == "#ffffff"
     assert alpha in _SCRIM_ALPHA_WINDOW
+
+
+def test_chosen_scrim_opacity_overrides_the_solved_alpha() -> None:
+    """A scrim_opacity on the values (the design-tokens knob is the
+    only setter) replaces the auto solve entirely: the gradient
+    carries the brand tint at the CHOSEN alpha (0.8, formatted 0.80, a
+    value outside the solve's design window); with the knob absent the
+    solved alpha applies as before."""
+    chosen = generate_theme_css(
+        _replace(caps(), scrim_opacity=0.8), background_data_uri=_PNG_DATA_URI
+    )
+    block = re.search(r"section \{[^}]*background-image:[^}]*\}", chosen)
+    assert block is not None
+    assert "rgba(0, 103, 158, 0.80)" in block.group(0)  # #00679e at 0.8
+    auto = generate_theme_css(caps(), background_data_uri=_PNG_DATA_URI)
+    alpha, _tint = _scrim_alpha("#00679e", "#ffffff")
+    rule_auto = re.search(r"section \{[^}]*background-image:[^}]*\}", auto)
+    assert rule_auto is not None
+    assert f"rgba(0, 103, 158, {alpha:.2f})" in rule_auto.group(0)
+
+
+def test_low_contrast_chosen_scrim_opacity_warns_but_is_honored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The soft-warning contract: a chosen opacity that cannot keep the
+    text readable over a worst-case image (the mid-gray #8a8a8a at
+    0.55 behind white text fails the both-ends floor over white) logs
+    exactly one WARNING naming the opacity and the measured contrast,
+    and the CSS still carries the chosen alpha: a branding choice is
+    the owner's to make, and the auto solve is not silently
+    re-applied."""
+    with caplog.at_level(logging.WARNING, logger="marp_slides.theming"):
+        css = generate_theme_css(
+            _replace(
+                caps(color="#8a8a8a", color_text="#ffffff", background_text="#ffffff"),
+                scrim_opacity=0.55,
+            ),
+            background_data_uri=_PNG_DATA_URI,
+        )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "scrim opacity" in warnings[0].getMessage()
+    assert "1.8" in warnings[0].getMessage()  # the measured worst case
+    block = re.search(r"section \{[^}]*background-image:[^}]*\}", css)
+    assert block is not None
+    assert "rgba(138, 138, 138, 0.55)" in block.group(0)
+
+
+def test_chosen_scrim_opacity_without_image_is_inert() -> None:
+    """No background image, no scrim: the knob changes nothing and
+    warns about nothing (the flat brand color covers every slide)."""
+    css = generate_theme_css(_replace(caps(scrim_opacity=0.8), background=""))
+    assert "background-image" not in css
 
 
 def test_contrast_matches_wcag_reference_pairs() -> None:

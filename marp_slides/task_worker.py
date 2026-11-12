@@ -2190,8 +2190,9 @@ def _resolve_theming_values(
     A design tokens file (the conventional path, or a picked
     ``tokens_file`` input when the task carried one) in the TASK
     OWNER's Files (the org-branding scenario) REPLACES the instance
-    branding: the overlay's token colors and font win, the instance
-    background, slogan and name are cleared, and every gate and render
+    branding: the overlay's token colors and font win, the background
+    image survives under a scrim of the token color, and the slogan
+    and name are cleared; every gate and render
     of the task measures and renders the token-branded theme through
     this same seam. The file is resolved ONCE per task
     (:func:`_task_design_tokens`), under the task's ambient DAV

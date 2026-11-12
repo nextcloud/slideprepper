@@ -28,11 +28,15 @@ the Chromium PDF render) with zero outbound fetches.
 
 A design tokens file in the task owner's Files can steer the branding
 (colors and the font family) through these same values: the tokens
-overlay REPLACES the instance-derived fields on :class:`ThemingValues`
-(the org-branding scenario; see :mod:`marp_slides.design_tokens`), and a
-token font rides the stack FIRST with the bundled Inter as its fallback.
-Slide geometry is never part of the overlay: sizes, spacing and padding
-stay template-fixed so the per-slide overflow guarantee survives custom
+overlay REPLACES the instance-derived color and font fields on
+:class:`ThemingValues` (the org-branding scenario; see
+:mod:`marp_slides.design_tokens`), and a token font rides the stack
+FIRST with the bundled Inter as its fallback. The background image
+SURVIVES the overlay: the scrim is solved from the token pair (the
+overlay re-points ``color`` and ``background_text``), so an org palette
+composes with the instance photo instead of erasing it. Slide geometry
+is never part of the overlay: sizes, spacing and padding stay
+template-fixed so the per-slide overflow guarantee survives custom
 branding (the overflow gates measure the actually rendered deck, wide
 token fonts included).
 
@@ -60,7 +64,12 @@ from the WCAG contrast between ``background_text`` and the scrim
 blended over both a white and a black image, inside the 0.55-0.75
 design window (see :func:`_scrim_alpha`). A brand color that cannot
 reach the large-text contrast floor even at full window gets a neutral
-scrim instead, so the text stays readable under any branding.
+scrim instead, so the text stays readable under any branding. A
+``scrim_opacity`` design token replaces the solve with the owner's
+chosen alpha (auto default plus manual override plus a soft warning,
+the settled overlay-control pattern); a chosen opacity that fails the
+same floor is honored with one WARNING (see
+:func:`_warn_unreadable_scrim`).
 
 PPTX output ignores the theme entirely (python-pptx has no theme API);
 the theme affects html and pdf output only, matching the existing
@@ -206,10 +215,12 @@ class ThemingValues:
     Every field is a plain string exactly as it appears in the capabilities
     dict (hex colors as ``#RRGGBB``, the background as an absolute URL or
     ``#RRGGBB`` for plain colors, the slogan as free text), except
-    ``font_family``: no theming capability carries a font, so it is empty
-    for every instance-derived value and only the design-tokens overlay
-    sets it (a font family name that rides the slide font stack FIRST,
-    with the bundled Inter as the fallback; see :func:`_font_stack`).
+    ``font_family`` and ``scrim_opacity``: no theming capability carries
+    either, so they are empty/None for every instance-derived value and
+    only the design-tokens overlay sets them (a font family name that
+    rides the slide font stack FIRST, with the bundled Inter as the
+    fallback, see :func:`_font_stack`; a scrim alpha that overrides the
+    contrast-solved one, see :func:`_background_css`).
     """
 
     color: str
@@ -222,13 +233,15 @@ class ThemingValues:
     name: str
     cache_buster: str
     font_family: str = ""
+    scrim_opacity: float | None = None
 
     @classmethod
     def from_capabilities(cls, theming: Mapping[str, Any]) -> ThemingValues:
         """Build from the raw ``capabilities["theming"]`` dict; missing
-        keys use THEMING_DEFAULTS. ``font_family`` stays empty: the
-        capabilities API carries no font, so the stock Inter-first stack
-        applies and only a design tokens file can steer the font."""
+        keys use THEMING_DEFAULTS. ``font_family`` stays empty and
+        ``scrim_opacity`` stays None: the capabilities API carries
+        neither, so the stock Inter-first stack and the auto-computed
+        scrim apply, and only a design tokens file can steer them."""
 
         def get(key: str) -> str:
             return str(theming.get(key, THEMING_DEFAULTS.get(key, ""))).strip()
@@ -473,7 +486,12 @@ def _background_css(values: ThemingValues, background_data_uri: str | None) -> s
     image covers the brand background wherever the author placed it.
     Without a background value there is no rule at all: the solid
     instance color covers every slide. The scrim alpha is solved from
-    the text/brand contrast, not assumed (see :func:`_scrim_alpha`).
+    the text/brand contrast, not assumed (see :func:`_scrim_alpha`),
+    UNLESS the values carry a chosen ``scrim_opacity`` (the
+    design-tokens knob): the owner's alpha then replaces the solve
+    entirely, tint and all (no neutral fallback either), and its
+    contrast is checked with one soft WARNING instead of being silently
+    clamped (see :func:`_warn_unreadable_scrim`).
     """
     background = values.background
     if not background:
@@ -488,7 +506,15 @@ def _background_css(values: ThemingValues, background_data_uri: str | None) -> s
         )
     if background_data_uri is None:
         return ""
-    scrim_alpha, scrim_tint = _scrim_alpha(values.color, values.background_text)
+    if values.scrim_opacity is None:
+        scrim_alpha, scrim_tint = _scrim_alpha(values.color, values.background_text)
+    else:
+        # manual control (the scrim_opacity design token): the brand
+        # tint at the chosen alpha, no auto solve and no neutral
+        # fallback; the choice is honored and only warned about
+        scrim_alpha = values.scrim_opacity
+        scrim_tint = values.color
+        _warn_unreadable_scrim(scrim_tint, values.background_text, scrim_alpha)
     scrim = _rgba_css(scrim_tint, scrim_alpha)
     return (
         f"\n{selector} {{\n"
@@ -686,3 +712,33 @@ def _scrim_alpha(tint: str, text: str) -> tuple[float, str]:
         if min(over_white, over_black) >= WCAG_LARGE_TEXT_CONTRAST_FLOOR:
             return alpha, neutral
     return _SCRIM_ALPHA_WINDOW[-1], neutral
+
+
+def _warn_unreadable_scrim(tint: str, text: str, alpha: float) -> None:
+    """WARNING (not an error) when a CHOSEN scrim alpha (the
+    ``scrim_opacity`` design token) cannot keep ``text`` readable over
+    the tint blended on a worst-case image (pure white and pure black),
+    the same both-ends test :func:`_scrim_alpha` solves inside. The
+    choice is still honored: a branding decision is the owner's to
+    make, and the settled overlay-control pattern is an auto default
+    plus a manual override plus a soft warning, but a deck that passes
+    every gate and may ship hard to read must at least leave a trace.
+    Mirrors :func:`marp_slides.design_tokens._warn_unreadable_pair` in
+    tone and trigger (the auto solve never lands here: it clamps
+    inside its design window until the floor clears, or falls back to
+    a neutral scrim that always does)."""
+    over_white = _contrast(text, _blend_hex(tint, alpha, (255, 255, 255)))
+    over_black = _contrast(text, _blend_hex(tint, alpha, (0, 0, 0)))
+    worst = min(over_white, over_black)
+    if worst < WCAG_LARGE_TEXT_CONTRAST_FLOOR:
+        LOGGER.warning(
+            "the chosen scrim opacity %.2f tints %s behind %s text and "
+            "reaches only %.2f:1 over a worst-case image (the WCAG "
+            "large-text floor is %.1f:1); the opacity is honored but "
+            "the deck may be hard to read",
+            alpha,
+            tint,
+            text,
+            worst,
+            WCAG_LARGE_TEXT_CONTRAST_FLOOR,
+        )

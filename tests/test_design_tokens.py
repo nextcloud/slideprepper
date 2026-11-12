@@ -2,14 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Design tokens v1: the strict schema (accept/reject/unknown keys), the
 fail-soft owner-Files discovery (present/absent/malformed), the overlay
-that replaces instance branding, and the guarantee that token values
-steer the generated CSS while the template-fixed geometry stays
+that replaces instance color/font branding while the background image
+survives under a token-colored scrim, and the guarantee that token
+values steer the generated CSS while the template-fixed geometry stays
 untouched."""
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
+from dataclasses import replace as _replace
 from types import SimpleNamespace
 
 import pytest
@@ -41,7 +45,7 @@ FULL_FILE = {
 
 
 #: An instance-branded base for the overlay tests: every field set to
-#: something the tokens must replace or clear.
+#: something the tokens must replace, keep or clear.
 def _instance_values() -> ThemingValues:
     return ThemingValues.from_capabilities(
         {
@@ -56,6 +60,13 @@ def _instance_values() -> ThemingValues:
             "cacheBuster": "1d9e0e2e",
         }
     )
+
+
+#: Tiny fake PNG bytes and their data URI, the same shape the theming
+#: seam materializes for an instance background (what the coexistence
+#: tests inject as the already-fetched image).
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"payload" * 4
+_PNG_DATA_URI = f"data:image/png;base64,{base64.b64encode(_PNG_BYTES).decode('ascii')}"
 
 
 # --- schema: accept ---------------------------------------------------------------
@@ -233,22 +244,88 @@ def test_font_family_at_the_cap_is_accepted() -> None:
     assert parse_design_tokens({"font_family": name}).font_family == name
 
 
-# --- overlay: the file replaces instance branding ----------------------------------
+# --- scrim_opacity: the manual scrim knob -------------------------------------------
 
 
-def test_overlay_replaces_branding_and_clears_instance_fields() -> None:
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(0.8, 0.8), (0.55, 0.55), (0, 0.0), (1, 1.0), (1.0, 1.0)],
+)
+def test_scrim_opacity_accepts_numbers_in_range(value: object, expected: float) -> None:
+    """A JSON number in [0.0, 1.0], endpoints included; ints widen to
+    their float forms so the CSS carries one shape."""
+    tokens = parse_design_tokens({"scrim_opacity": value})
+    assert tokens.scrim_opacity == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [1.5, -0.1, "banana", "0.5", True, False, [0.5], float("nan"), float("inf")],
+)
+def test_scrim_opacity_rejects_everything_else(value: object) -> None:
+    """Out-of-range numbers reject rather than clamp (a clamped opacity
+    would silently render something the owner never wrote), and
+    non-number shapes reject rather than coerce: a string '0.5' is not
+    a number, and booleans must not ride the CSS as 1.0/0.0. NaN and
+    Infinity fail the range test. Like every schema violation this
+    ignores the whole file."""
+    with pytest.raises(DesignTokensError, match="scrim_opacity"):
+        parse_design_tokens({"scrim_opacity": value})
+
+
+def test_scrim_opacity_absent_means_the_auto_solve() -> None:
+    tokens = parse_design_tokens(dict(FULL_FILE))
+    assert tokens.scrim_opacity is None
+
+
+# --- overlay: the file replaces instance branding, the image survives ---------------
+
+
+def test_overlay_replaces_branding_and_keeps_the_background_image() -> None:
+    """The Phase A fix this pins: the overlay steers colors and font
+    while the background image SURVIVES (a token-branded deck carries
+    the instance photo under a scrim of the token color), and the
+    cache-buster survives with the URL it belongs to. The slogan and
+    name are still cleared: no instance-specific field the CSS does not
+    consume may leak into an org deck."""
     values = parse_design_tokens(dict(FULL_FILE)).overlay(_instance_values())
     assert values.color == "#3a1b5d"
     assert values.color_text == "#f5f0e8"
     assert values.font_family == "IBM Plex Sans"
-    # the instance's own branding must not leak into a token-branded deck
-    assert values.background == ""  # no instance photo behind org colors
+    # the instance photo survives the overlay, with its cache-buster
+    assert values.background == "http://nextcloud.local:8350/apps/theming/img/x.webp"
+    assert values.cache_buster == "1d9e0e2e"
+    # the scrim pair is fully token-derived: the WCAG solve runs against
+    # the token color/text, never the instance pair
     assert values.background_text == "#f5f0e8"
+    # the instance's own non-consumed branding must not leak
     assert values.slogan == ""
     assert values.name == ""
-    assert values.cache_buster == "0"
     assert values.color_element_bright == "#3a1b5d"
     assert values.color_element_dark == "#3a1b5d"
+
+
+def test_overlay_clears_a_plain_color_background() -> None:
+    """A ``#RRGGBB`` background is itself a color choice, and colors are
+    the tokens' domain: it is cleared so the flat token color covers
+    every slide with its coherent pairing. Keeping it would paint the
+    token text color over an admin-chosen hex with no scrim to mediate
+    and no warning path to catch the mismatch (the unreadable-pair
+    check compares the token pair only)."""
+    values = parse_design_tokens(dict(FULL_FILE)).overlay(
+        _replace(_instance_values(), background="#102a43")
+    )
+    assert values.background == ""
+
+
+def test_overlay_carries_the_chosen_scrim_opacity() -> None:
+    """The knob rides the values into the background-image rule: a
+    chosen opacity is carried through the overlay, an absent one stays
+    None so the theme's contrast solve keeps control."""
+    chosen = parse_design_tokens({**FULL_FILE, "scrim_opacity": 0.8})
+    absent = parse_design_tokens(dict(FULL_FILE))
+    assert chosen.overlay(_instance_values()).scrim_opacity == 0.8
+    assert absent.overlay(_instance_values()).scrim_opacity is None
 
 
 def test_overlay_leaves_base_untouched() -> None:
@@ -269,7 +346,55 @@ def test_css_reflects_token_values() -> None:
     assert 'font-family: "IBM Plex Sans", "Inter", -apple-system,' in css
     # the bundled Inter stays embedded: it IS the fallback for the token font
     assert css.count("@font-face {") == 2
-    # the instance photo did not survive the overlay
+    # the URL background survives in the values, but a URL without
+    # materialized bytes never rides the CSS (the remote form renders
+    # hollow; only a fetched data URI is embedded)
+    assert "background-image" not in css
+
+
+def test_css_composes_token_colors_with_the_background_image() -> None:
+    """The Phase A acceptance: with the background image materialized,
+    the generated CSS carries BOTH the embedded data URI and a scrim of
+    the TOKEN color (#3a1b5d = rgb(58, 27, 93)), not the instance blue
+    (#0082c9 = rgb(0, 130, 201)): the scrim solve runs against the
+    token pair because the overlay re-points both ``color`` and
+    ``background_text``."""
+    values = parse_design_tokens(dict(FULL_FILE)).overlay(_instance_values())
+    css = generate_theme_css(values, background_data_uri=_PNG_DATA_URI)
+    block = re.search(r"section \{[^}]*background-image:[^}]*\}", css)
+    assert block is not None
+    rule = block.group(0)
+    assert f"url('{_PNG_DATA_URI}')" in rule  # the instance photo rides along
+    assert "linear-gradient(" in rule
+    assert rule.index("linear-gradient(") < rule.index("url('")  # scrim on top
+    assert "rgba(58, 27, 93, 0." in rule  # the scrim tint is the token color
+    assert "rgba(0, 130, 201, 0." not in rule  # never the instance color
+    assert "color: #f5f0e8;" in rule  # the token text pairing
+
+
+def test_css_uses_the_chosen_scrim_opacity_over_the_solved_alpha() -> None:
+    """With the knob set, the gradient carries the token tint at the
+    CHOSEN alpha (0.8, outside the solve's 0.55-0.75 window), not any
+    auto-computed value: the manual override replaces the solve
+    entirely."""
+    values = parse_design_tokens({**FULL_FILE, "scrim_opacity": 0.8}).overlay(
+        _instance_values()
+    )
+    css = generate_theme_css(values, background_data_uri=_PNG_DATA_URI)
+    block = re.search(r"section \{[^}]*background-image:[^}]*\}", css)
+    assert block is not None
+    assert "rgba(58, 27, 93, 0.80)" in block.group(0)
+
+
+def test_css_flat_token_color_when_no_background_exists() -> None:
+    """A no-image instance (empty background) keeps today's behavior:
+    the flat token color with its pairing, no background-image rule at
+    all."""
+    values = parse_design_tokens(dict(FULL_FILE)).overlay(
+        _replace(_instance_values(), background="")
+    )
+    css = generate_theme_css(values)
+    assert "background-color: #3a1b5d;" in css
     assert "background-image" not in css
 
 
@@ -520,10 +645,10 @@ def test_disabled_sentinel_reaches_the_read_through_settings() -> None:
 
 
 def test_token_keys_are_exactly_the_v1_schema() -> None:
-    """The v1 surface is pinned: two colors and one font, the branding
-    axes the generated CSS parameterizes. Growing the schema must be a
-    deliberate change to this tuple."""
-    assert TOKEN_KEYS == ("color", "color_text", "font_family")
+    """The v1 surface is pinned: two colors, the scrim opacity and one
+    font, the branding axes the generated CSS parameterizes. Growing
+    the schema must be a deliberate change to this tuple."""
+    assert TOKEN_KEYS == ("color", "color_text", "font_family", "scrim_opacity")
 
 
 def test_schema_surface_mirrored_by_the_context_agent_tool() -> None:
@@ -534,7 +659,7 @@ def test_schema_surface_mirrored_by_the_context_agent_tool() -> None:
     value it mirrors is pinned here: a change to any of them must update
     that mirror too, or the tool starts writing files this parser rejects
     (fail-soft, but the user's branding silently stops applying)."""
-    assert TOKEN_KEYS == ("color", "color_text", "font_family")
+    assert TOKEN_KEYS == ("color", "color_text", "font_family", "scrim_opacity")
     assert _MAX_FONT_FAMILY_CHARS == 128
     assert set('"\\`<>{};') == _FORBIDDEN_FONT_CHARS
     assert WCAG_LARGE_TEXT_CONTRAST_FLOOR == 3.0

@@ -11,8 +11,12 @@ Nextcloud. The owner drops a tokens file at a conventional path
 generates (authoring task, chat tool schedule and re-render alike: they
 all resolve the branded theme through the same
 :func:`marp_slides.task_worker._resolve_theming_values` seam) carries
-the token branding INSTEAD of the instance theming: the file replaces
-instance-derived branding, it does not merge with it.
+the token branding INSTEAD of the instance theming for every axis the
+tokens own: colors and the font replace their instance-derived
+counterparts outright (the file does not merge with them), while the
+instance background IMAGE survives under a scrim of the token color,
+so org branding composes with the instance's imagery instead of
+erasing it.
 
 A generation task can also name a tokens file PER DECK through the
 optional ``tokens_file`` input (a picked file id, resolved by
@@ -21,8 +25,9 @@ picked file overrides the conventional path for that one task, and an
 unusable picked file falls back to the conventional chain rather than
 failing the deck.
 
-v1 is deliberately shallow: two colors and one font family, exactly the
-branding surface the generated theme CSS parameterizes today (see
+v1 is deliberately shallow: two colors, one font family and a scrim
+opacity, exactly the branding surface the generated theme CSS
+parameterizes today (see
 :func:`marp_slides.theming.generate_theme_css`). No raw CSS, no sizes,
 no spacing: slide geometry stays template-fixed so the per-slide
 overflow guarantee survives custom branding. A token font resolves BY
@@ -81,9 +86,11 @@ LOGGER = logging.getLogger("marp_slides.design_tokens")
 DISABLED_TOKENS_PATHS = ("-", "off")
 
 #: The token keys of schema v1, derived from what the theme CSS
-#: parameterizes: the slide background color, its paired text color and
-#: the slide font family. Nothing else is steerable in v1.
-TOKEN_KEYS = ("color", "color_text", "font_family")
+#: parameterizes: the slide background color, its paired text color,
+#: the slide font family, and the scrim opacity over a background
+#: image (the manual override of the auto-computed alpha). Nothing
+#: else is steerable in v1.
+TOKEN_KEYS = ("color", "color_text", "font_family", "scrim_opacity")
 
 #: Raw-byte cap for the tokens file. Three keys never need more than a
 #: few hundred bytes; anything past this cap is a wrong file (or a
@@ -132,33 +139,46 @@ class DesignTokens:
     stock theming default and an absent text color is DERIVED from the
     effective color's luminance (never the instance theming: the file
     replaces instance-derived branding, so a partial file is partial
-    stock-or-derived branding, not a mix of two sources)."""
+    stock-or-derived branding, not a mix of two sources). The one
+    optional field is ``scrim_opacity``: None means the theme's
+    contrast solve computes the scrim alpha, and a chosen value (the
+    manual override) rides the values into the background-image rule."""
 
     color: str
     color_text: str
     font_family: str
+    scrim_opacity: float | None = None
 
     def overlay(self, base: ThemingValues) -> ThemingValues:
         """Apply the tokens OVER the instance-derived values: the token
-        branding wins, and every instance-specific field the CSS does
-        not consume is cleared rather than leaked (an instance
-        background photo behind org colors, or an instance slogan in an
-        org deck, would be a branding bug if a future consumer ever
-        surfaced them). The unused element-color fields go token-coherent
-        for the same reason. Returns a new values object; ``base`` is
-        untouched."""
+        colors and font win, and the background IMAGE survives them (a
+        token-branded deck still carries the instance photo, under a
+        scrim of the token color instead of the instance color, so the
+        org palette composes with the instance's imagery rather than
+        erasing it). A plain-COLOR background is itself a color choice,
+        and colors are the tokens' domain: it is cleared, so the flat
+        token color covers every slide with its coherent derived-or-
+        explicit text pairing (there is no scrim to mediate a token text
+        color over an admin-chosen hex, and no warning path would catch
+        the mismatch). The cache-buster survives with the image URL it
+        belongs to. Every instance-specific field the CSS does not
+        consume is still cleared rather than leaked (an instance slogan
+        in an org deck would be a branding bug if a future consumer ever
+        surfaced it), and the unused element-color fields go
+        token-coherent for the same reason. Returns a new values object;
+        ``base`` is untouched."""
         return replace(
             base,
             color=self.color,
             color_text=self.color_text,
             color_element_bright=self.color,
             color_element_dark=self.color,
-            background="",  # file branding carries no background image
+            background=("" if base.background.startswith("#") else base.background),
             background_text=self.color_text,
             slogan="",
             name="",
-            cache_buster="0",  # nothing left to cache-bust
             font_family=self.font_family,
+            scrim_opacity=self.scrim_opacity,
         )
 
 
@@ -168,7 +188,8 @@ def parse_design_tokens(document: object) -> DesignTokens:
 
     Raises :class:`DesignTokensError` for everything outside the v1
     schema: a non-object root, unknown keys (listed in the message, so a
-    typo names itself), malformed colors, or a font family name that is
+    typo names itself), malformed colors, a scrim opacity that is not a
+    number between 0.0 and 1.0, or a font family name that is
     empty, oversize, or carries characters forbidden by the injection
     guard. Colors normalize to the lowercase 6-digit form (the short
     ``#RGB`` form widens) so the generated CSS carries one shape. An
@@ -190,7 +211,13 @@ def parse_design_tokens(document: object) -> DesignTokens:
     color = _parse_color(document.get("color"), "color", THEMING_DEFAULTS["color"])
     color_text = _derive_or_parse_color_text(document.get("color_text"), color)
     font_family = _parse_font_family(document.get("font_family"))
-    return DesignTokens(color=color, color_text=color_text, font_family=font_family)
+    scrim_opacity = _parse_scrim_opacity(document.get("scrim_opacity"))
+    return DesignTokens(
+        color=color,
+        color_text=color_text,
+        font_family=font_family,
+        scrim_opacity=scrim_opacity,
+    )
 
 
 def _derive_or_parse_color_text(value: object, color: str) -> str:
@@ -254,6 +281,32 @@ def _parse_font_family(value: object) -> str:
                 "rejected on purpose"
             )
     return name
+
+
+def _parse_scrim_opacity(value: object) -> float | None:
+    """The scrim opacity knob: a JSON number between 0.0 and 1.0
+    (endpoints included; ``0`` and ``1`` widen to the float forms).
+    Absent means None, the theme's contrast solve computes the alpha.
+    Everything else is a file error naming the value: a boolean is not
+    a number (JSON ``true`` must not ride the CSS as ``1.0``), a
+    string is not a number (``"0.5"`` rejects rather than parses,
+    because silently coercing shapes hides what the file actually
+    says), and NaN/Infinity fail the range test. Out-of-range values
+    are rejected rather than clamped for the same reason: a clamped
+    opacity would log nothing and render something the owner never
+    wrote."""
+    if value is None:
+        return None
+    hint = (
+        "the design token 'scrim_opacity' must be a number between "
+        f"0.0 and 1.0, got {value!r}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DesignTokensError(hint)
+    opacity = float(value)
+    if not 0.0 <= opacity <= 1.0:
+        raise DesignTokensError(hint)
+    return opacity
 
 
 def read_design_tokens(nc: Any, path: str) -> DesignTokens | None:
