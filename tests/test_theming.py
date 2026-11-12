@@ -14,8 +14,10 @@ import logging
 import re
 import urllib.request
 from dataclasses import replace as _replace
+from types import SimpleNamespace
 
 import pytest
+from nc_py_api import NextcloudException
 
 from marp_slides.theming import (
     _SCRIM_ALPHA_WINDOW,
@@ -26,7 +28,9 @@ from marp_slides.theming import (
     _contrast,
     _fetch_background_uri,
     _scrim_alpha,
+    fetch_user_background_data_uri,
     generate_theme_css,
+    read_background_by_id,
     write_theme_css,
 )
 
@@ -757,3 +761,202 @@ def test_fetch_failure_reason_names_body_defects(monkeypatch, caplog) -> None:
     message = caplog.records[-1].getMessage()
     assert "not an image" in message
     assert "text/html" in message
+
+
+# --- the task owner's saved background (the impersonated raw fetch) --------------
+
+
+class _FakeBackgroundSession:
+    """The app-context session surface :func:`fetch_user_background_data_uri`
+    consumes: ``download2stream(path, sink)``, the raw-download mechanism
+    behind ``nc.download_log``, answering with canned bytes or raising
+    like the theming route would (404 when the user saved no custom
+    background, a transport error when the instance is unreachable)."""
+
+    def __init__(
+        self, payload: bytes | None = None, error: Exception | None = None
+    ) -> None:
+        self._payload = payload
+        self._error = error
+        self.requested: list[str] = []
+
+    def download2stream(self, url_path: str, fp) -> None:
+        self.requested.append(url_path)
+        if self._error is not None:
+            raise self._error
+        fp.write(self._payload)
+
+
+def test_user_background_fetch_reads_the_theming_route() -> None:
+    """The fetch hits exactly the per-user route and returns the sniffed,
+    capped, materialized data URI the resolution seam carries into
+    ThemingValues."""
+    session = _FakeBackgroundSession(payload=_PNG_BYTES)
+    uri = fetch_user_background_data_uri(SimpleNamespace(_session=session))
+    assert uri == _PNG_DATA_URI
+    assert session.requested == ["/index.php/apps/theming/background"]
+
+
+def test_user_background_fetch_without_a_session_is_a_quiet_skip(caplog) -> None:
+    """No app-context session on the client (every unit-test fake, and a
+    hypothetically degraded runtime): the fetch is skipped with a DEBUG,
+    never a raise."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    assert fetch_user_background_data_uri(SimpleNamespace()) is None
+    assert any("no app session" in r.getMessage() for r in caplog.records)
+
+
+def test_user_background_not_set_degrades_quietly_to_the_admin_path(caplog) -> None:
+    """404 is the DEFAULT state (a user who never saved a custom
+    background): one DEBUG naming 'not set', no exception, None."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    session = _FakeBackgroundSession(
+        error=NextcloudException(404, reason="No custom background")
+    )
+    assert fetch_user_background_data_uri(SimpleNamespace(_session=session)) is None
+    assert any(
+        "not set (404)" in r.getMessage() and r.levelname == "DEBUG"
+        for r in caplog.records
+    )
+
+
+def test_user_background_transport_error_degrades_quietly(caplog) -> None:
+    """Connection errors and timeouts fail soft at DEBUG (ambient user
+    state, not a per-task decision: no WARNING noise per render)."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    session = _FakeBackgroundSession(error=RuntimeError("connection reset"))
+    assert fetch_user_background_data_uri(SimpleNamespace(_session=session)) is None
+    assert any(
+        "RuntimeError: connection reset" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_user_background_oversize_aborts_mid_stream(caplog) -> None:
+    """A body past the raw-byte cap is abandoned as soon as the sink
+    detects it (the theming route reports no size up front) and degrades
+    to the admin background at DEBUG."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    session = _FakeBackgroundSession(
+        payload=b"\x89PNG\r\n\x1a\n" + b"0" * (BACKGROUND_MAX_BYTES + 5)
+    )
+    assert fetch_user_background_data_uri(SimpleNamespace(_session=session)) is None
+    assert any(
+        "exceeds the" in r.getMessage() and "cap" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_user_background_non_image_bytes_degrade_quietly(caplog) -> None:
+    """Bytes that sniff as no image (an HTML error page a proxy might
+    return) fail soft like every other degradation."""
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    session = _FakeBackgroundSession(payload=b"<html>sign-in page</html>")
+    assert fetch_user_background_data_uri(SimpleNamespace(_session=session)) is None
+    assert any("not a decodable image" in r.getMessage() for r in caplog.records)
+
+
+def test_data_uri_background_renders_without_a_fetch(tmp_path) -> None:
+    """A ``data:`` value background (the user-background form the
+    resolution seam materializes) is its own materialization: the scrim
+    rule embeds it and the write seam never fetches."""
+    calls: list[str] = []
+
+    def _must_not_fetch(url: str) -> str | None:
+        calls.append(url)
+        return None
+
+    css_path = write_theme_css(
+        caps(background=_PNG_DATA_URI), tmp_path, background_fetch=_must_not_fetch
+    )
+    assert calls == []
+    css = css_path.read_text(encoding="utf-8")
+    assert f"url('{_PNG_DATA_URI}')" in css
+    assert "linear-gradient(" in css
+
+
+# --- the picked background file (the per-deck override) ---------------------------
+
+
+def _picked_background_files(
+    nodes: dict[int, object], blobs: dict[int, bytes]
+) -> SimpleNamespace:
+    """The Files API surface :func:`read_background_by_id` consumes."""
+    return SimpleNamespace(
+        by_id=nodes.get,
+        download=lambda node: blobs[node.file_id],
+    )
+
+
+def _picked_node(
+    file_id: int,
+    *,
+    size: int | None = None,
+    is_dir: bool = False,
+    mimetype: str = "image/png",
+):
+    return SimpleNamespace(
+        file_id=file_id,
+        name=f"{file_id}.png",
+        is_dir=is_dir,
+        user_path=f"Branding/{file_id}.png",
+        info=SimpleNamespace(
+            mimetype=mimetype,
+            content_length=len(_PNG_BYTES) if size is None else size,
+        ),
+    )
+
+
+def test_picked_background_is_read_by_id_and_labeled_by_path() -> None:
+    """The picked file is downloaded by its id, sniffed, capped and
+    materialized exactly like the instance background, and the label for
+    the logs is the file's own Files path."""
+    files = _picked_background_files({7: _picked_node(7)}, {7: _PNG_BYTES})
+    data_uri, label = read_background_by_id(SimpleNamespace(files=files), 7)
+    assert data_uri == _PNG_DATA_URI
+    assert label == "Branding/7.png"
+
+
+def test_picked_background_without_files_api_is_a_quiet_skip(caplog) -> None:
+    caplog.set_level("DEBUG", logger="marp_slides.theming")
+    data_uri, label = read_background_by_id(SimpleNamespace(), 7)
+    assert data_uri is None
+    assert label == "file id 7"
+    assert any("no Files API" in r.getMessage() for r in caplog.records)
+
+
+def test_unresolvable_picked_background_warns_and_fails_soft(caplog) -> None:
+    """An id that resolves to nothing (or a folder) is one WARNING
+    naming the pick, never a raise: the caller falls back to the saved
+    user or instance background."""
+    caplog.set_level("WARNING", logger="marp_slides.theming")
+    files = _picked_background_files({8: _picked_node(8, is_dir=True)}, {})
+    data_uri, _label = read_background_by_id(SimpleNamespace(files=files), 8)
+    assert data_uri is None
+    assert any("not a readable file" in r.getMessage() for r in caplog.records)
+
+
+def test_oversize_picked_background_warns_and_fails_soft(caplog) -> None:
+    """The pre-download size check mirrors the tokens reader: a node
+    reporting past the raw-byte cap is never downloaded."""
+    caplog.set_level("WARNING", logger="marp_slides.theming")
+    node = _picked_node(9, size=BACKGROUND_MAX_BYTES + 1)
+    files = _picked_background_files({9: node}, {9: _PNG_BYTES})
+    downloaded: list[int] = []
+    files.download = lambda n: downloaded.append(n.file_id) or b""
+    data_uri, _label = read_background_by_id(SimpleNamespace(files=files), 9)
+    assert data_uri is None
+    assert downloaded == []
+    message = caplog.records[-1].getMessage()
+    assert "ignored" in message and str(BACKGROUND_MAX_BYTES) in message
+
+
+def test_non_image_picked_background_warns_and_fails_soft(caplog) -> None:
+    """Bytes that are no image by magic NOR by the node's own mimetype
+    (the header only breaks ties in :func:`_background_data_uri`, so
+    BOTH signals must lie for the rejection) are one WARNING."""
+    caplog.set_level("WARNING", logger="marp_slides.theming")
+    node = _picked_node(10, mimetype="text/plain")
+    files = _picked_background_files({10: node}, {10: b"not an image"})
+    data_uri, _label = read_background_by_id(SimpleNamespace(files=files), 10)
+    assert data_uri is None
+    assert any("not a usable image" in r.getMessage() for r in caplog.records)

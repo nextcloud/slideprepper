@@ -79,6 +79,7 @@ background-image behavior.
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import urllib.parse
 import urllib.request
@@ -189,6 +190,18 @@ _BACKGROUND_FETCH_TIMEOUT_S = 10.0
 #: bounded at two attempts before the fail-soft WARNING fires.
 _BACKGROUND_FETCH_ATTEMPTS = 2
 
+#: The theming app's per-user custom-background route (NC 35+): GET
+#: returns the REQUESTING user's saved custom background bytes, 404 when
+#: the user saved none (a shipped background or a flat color is "none"
+#: here; the admin background remains the fallback for those users).
+#: The call authenticates as the app-api session's impersonated user,
+#: so under the task worker it answers for the TASK OWNER.
+_USER_BACKGROUND_PATH = "/index.php/apps/theming/background"
+
+#: The HTTP status the theming route answers when the user saved no
+#: custom background (the quiet "not set" case, logged as DEBUG).
+_HTTP_NOT_FOUND = 404
+
 #: Magic-byte signatures of the image types an admin background can be
 #: (the NC35 stock background is a webp) and that every render consumer
 #: (Chromium for the PDF, browsers for the HTML deliverable) decodes.
@@ -221,6 +234,13 @@ class ThemingValues:
     rides the slide font stack FIRST, with the bundled Inter as the
     fallback, see :func:`_font_stack`; a scrim alpha that overrides the
     contrast-solved one, see :func:`_background_css`).
+    ``background`` carries one third form beyond the capabilities dict:
+    an already-materialized ``data:<mime>;base64,...`` URI, set by the
+    theming resolution seam when a picked background file or the task
+    owner's saved background overrides the instance one (see
+    :func:`read_background_by_id` / :func:`fetch_user_background_data_uri`)
+    so the image flows through the same CSS materialization path without
+    a second fetch.
     """
 
     color: str
@@ -386,7 +406,10 @@ def write_theme_css(
     This is the background materialization seam: the theme CSS is written
     once per render, and an http(s) admin background is fetched ONCE here
     (not once per slide; the bytes embed into the one CSS) and handed to
-    :func:`generate_theme_css` as a base64 data URI. ``background_fetch``
+    :func:`generate_theme_css` as a base64 data URI. A ``data:`` value
+    background (the task owner's saved background, materialized at the
+    theming resolution seam) passes straight through: it is its own data
+    URI, so this seam fetches nothing for it. ``background_fetch``
     defaults to the bounded, fail-soft :func:`_fetch_background_uri`;
     tests inject fakes so nothing in the unit suite touches the network.
     A failed fetch means no background rule in the CSS: the flat
@@ -449,7 +472,9 @@ def _font_stack(font_family: str) -> str:
 def _background_css(values: ThemingValues, background_data_uri: str | None) -> str:
     """Generate the every-slide background block from the theming values.
 
-    A plain ``#RRGGBB`` becomes a solid color; an http(s) URL becomes a
+    A plain ``#RRGGBB`` becomes a solid color; a ``data:`` background
+    (the user-background form the resolution seam materializes) is its
+    OWN data URI and needs no parameter; an http(s) URL becomes a
     ``background-image`` carrying the ALREADY-FETCHED ``background_data_uri``
     (base64 bytes embedded in the CSS, zero remote fetches downstream:
     the pipeline's marp conversions keep ``--allow-local-files`` off
@@ -504,6 +529,11 @@ def _background_css(values: ThemingValues, background_data_uri: str | None) -> s
             f"    color: {values.background_text};\n"
             f"}}\n"
         )
+    if background_data_uri is None and background.startswith("data:"):
+        # already materialized upstream (the task owner's saved
+        # background): the values themselves carry the bytes, so no
+        # fetch ever runs for this form
+        background_data_uri = background
     if background_data_uri is None:
         return ""
     if values.scrim_opacity is None:
@@ -622,6 +652,183 @@ def _fetch_background_uri(url: str) -> str | None:
         reason,
     )
     return None
+
+
+class _BackgroundTooLargeError(Exception):
+    """Raised by the bounded download sink the moment the user
+    background's streamed body passes the raw-byte cap (internal to
+    :func:`fetch_user_background_data_uri`; the abort is the fetch's
+    oversize answer, never a task failure)."""
+
+
+class _BoundedBackgroundSink:
+    """A ``download2stream`` target that aborts the download as soon as
+    the streamed body passes the raw-byte cap: the theming route
+    exposes no size metadata up front (unlike a Files node, whose
+    ``info.content_length`` is checked before the download), so the
+    admin fetch's never-buffer-an-oversize-body posture is enforced
+    here the only way the raw-download seam allows — by refusing to
+    write past the cap, which aborts the stream mid-body."""
+
+    def __init__(self) -> None:
+        self._buffer = io.BytesIO()
+
+    def write(self, chunk: bytes) -> int:
+        if self._buffer.tell() + len(chunk) > BACKGROUND_MAX_BYTES:
+            raise _BackgroundTooLargeError
+        return self._buffer.write(chunk)
+
+    def getvalue(self) -> bytes:
+        return self._buffer.getvalue()
+
+
+def fetch_user_background_data_uri(nc: Any) -> str | None:
+    """The task owner's SAVED custom background (NC 35 appearance
+    settings) as an already-materialized ``data:<mime>;base64,...`` URI,
+    or None on any failure — the platform-native per-user background,
+    read once per task by the theming resolution seam and carried in
+    :attr:`ThemingValues.background` in place of the admin background
+    URL, so it flows through the same CSS materialization path.
+
+    The GET on :data:`_USER_BACKGROUND_PATH` rides the app-context
+    session's raw-download mechanism (the one behind ``nc.download_log``;
+    ``nc.ocs`` is unusable here because it JSON-parses every response)
+    and therefore authenticates as the session's impersonated user —
+    the task owner the worker set with ``set_user`` before the
+    pipeline. Without one the server sees no logged-in user and answers
+    404, which is exactly the fail-soft path. The bytes face the same
+    magic-byte sniff and the same raw-byte cap as the admin background
+    (:func:`_background_data_uri`), with the cap enforced mid-stream by
+    the bounded sink.
+
+    Fail-soft at DEBUG, not WARNING, on every degradation — 404 (the
+    user saved no custom background; the most common case by far),
+    transport errors, timeouts, oversize bodies, non-image bytes: this
+    is ambient user state, not a deliberate per-task pick, and a user
+    who never touched the appearance settings would otherwise generate
+    a WARNING per render for nothing. The admin background the
+    capabilities carried applies; see :func:`_fetch_background_uri` for
+    the fetch that DOES warn when it fails."""
+    session = getattr(nc, "_session", None)
+    download = getattr(session, "download2stream", None)
+    if download is None:
+        LOGGER.debug("no app session available; the user background is not fetched")
+        return None
+    sink = _BoundedBackgroundSink()
+    try:
+        download(_USER_BACKGROUND_PATH, sink)
+    except _BackgroundTooLargeError:
+        LOGGER.debug(
+            "the user background exceeds the %d-byte cap; the instance "
+            "background applies",
+            BACKGROUND_MAX_BYTES,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - the user background must never fail a task
+        status = getattr(exc, "status_code", None)
+        LOGGER.debug(
+            "no user background is readable (%s); the instance background applies",
+            "not set (404)"
+            if status == _HTTP_NOT_FOUND
+            else f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    data_uri = _background_data_uri(sink.getvalue(), "")
+    if data_uri is None:
+        LOGGER.debug(
+            "the user background bytes are not a decodable image; the "
+            "instance background applies",
+        )
+        return None
+    return data_uri
+
+
+def _picked_file_label(node: Any, file_id: int) -> str:
+    """The label naming a picked file in messages: its Files path when
+    the node exposes one, its name otherwise, a file-id fallback when
+    even those are absent (the local twin of the design-tokens helper;
+    the modules cannot import each other's privates without a cycle)."""
+    user_path = str(getattr(node, "user_path", "") or "").strip().strip("/")
+    if user_path:
+        return user_path
+    name = str(getattr(node, "name", "") or "").strip()
+    return name or f"file id {file_id}"
+
+
+def read_background_by_id(nc: Any, file_id: int) -> tuple[str | None, str]:
+    """Read a PICKED background image file by its Nextcloud file id (the
+    generation task's optional ``background_file`` input) and materialize
+    it as a ``data:<mime>;base64,...`` URI: the same raw-byte cap, the
+    same magic-byte sniff and the same download seam as the instance
+    background (:func:`_background_data_uri`), differing only in how the
+    node is found (``by_id`` for an id the server already resolved and
+    access-checked at schedule time, not a path lookup).
+
+    Returns ``(data_uri, label)``: the materialized URI (None on any
+    problem, never a raise, so the caller falls back to the task owner's
+    saved background or the instance one) and the label naming the
+    picked file (its Files path, its name, or a file-id fallback) for
+    the caller's logs. A picked file is EXPECTED to exist and be a
+    usable image, so every problem is one WARNING, not the by-path
+    readers' DEBUG: the owner deliberately chose this file for this
+    deck and silence would hide why the deck did not carry it."""
+    files = getattr(nc, "files", None)
+    by_id = getattr(files, "by_id", None)
+    download = getattr(files, "download", None)
+    if by_id is None or download is None:
+        LOGGER.debug("no Files API available; the picked background file is skipped")
+        return None, f"file id {file_id}"
+    try:
+        node = by_id(file_id)
+    except Exception as exc:  # noqa: BLE001 - a branding file must never fail a task
+        LOGGER.warning(
+            "the picked background file (file id %s) could not be looked up "
+            "(%s); the saved user or instance background applies",
+            file_id,
+            exc,
+        )
+        return None, f"file id {file_id}"
+    label = _picked_file_label(node, file_id)
+    if node is None or getattr(node, "is_dir", False):
+        LOGGER.warning(
+            "the picked background file (file id %s) is not a readable "
+            "file; the saved user or instance background applies",
+            file_id,
+        )
+        return None, label
+    reported = getattr(getattr(node, "info", None), "content_length", None)
+    if isinstance(reported, int) and reported > BACKGROUND_MAX_BYTES:
+        LOGGER.warning(
+            "the picked background file '%s' is %d bytes (the cap is %d) "
+            "and is ignored; the saved user or instance background applies",
+            label,
+            reported,
+            BACKGROUND_MAX_BYTES,
+        )
+        return None, label
+    try:
+        data = bytes(download(node))
+    except Exception as exc:  # noqa: BLE001 - a branding file must never fail a task
+        LOGGER.warning(
+            "the picked background file '%s' could not be read (%s); the "
+            "saved user or instance background applies",
+            label,
+            exc,
+        )
+        return None, label
+    content_type = str(getattr(getattr(node, "info", None), "mimetype", "") or "")
+    data_uri = _background_data_uri(data, content_type)
+    if data_uri is None:
+        LOGGER.warning(
+            "the picked background file '%s' is not a usable image (%s); "
+            "the saved user or instance background applies",
+            label,
+            f"{len(data)} bytes, over the {BACKGROUND_MAX_BYTES}-byte cap"
+            if len(data) > BACKGROUND_MAX_BYTES
+            else f"unrecognized bytes, mimetype {content_type or 'unknown'}",
+        )
+        return None, label
+    return data_uri, label
 
 
 def _rgb(color: str) -> tuple[int, int, int]:

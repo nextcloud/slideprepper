@@ -181,6 +181,15 @@ PROVIDER = TaskProcessingProvider(
             shape_type=ShapeType.FILE,
         ),
         ShapeDescriptor(
+            name="background_file",
+            description=(
+                "Optional: pick a background image for this deck. "
+                "Overrides your saved background and the instance "
+                "branding."
+            ),
+            shape_type=ShapeType.FILE,
+        ),
+        ShapeDescriptor(
             name="max_slides",
             description=(
                 "Target deck length; the model aims for this many slides "

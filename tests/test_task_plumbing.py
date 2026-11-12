@@ -12,6 +12,7 @@ tmp_path."""
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -21,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from nc_py_api import NextcloudException
 from PIL import Image
 
 from marp_slides import task_worker
@@ -51,7 +53,12 @@ from marp_slides.settings import (
     PPTX_MIME_TYPE,
     Settings,
 )
-from marp_slides.theming import THEME_NAME, THEMING_DEFAULTS, ThemingValues
+from marp_slides.theming import (
+    BACKGROUND_MAX_BYTES,
+    THEME_NAME,
+    THEMING_DEFAULTS,
+    ThemingValues,
+)
 from tests.conftest import VALID_DECK
 
 TASK = {
@@ -2280,6 +2287,145 @@ def test_malformed_tokens_file_falls_back_to_instance_theming(
     assert any(
         "not valid JSON" in r.getMessage() and TOKENS_PATH in r.getMessage()
         for r in caplog.records
+    )
+
+
+# --- the task owner's saved background rides the resolution seam ------------------
+
+
+#: Tiny PNG bytes and their materialized data URI: what a fake theming
+#: session serves for a user who saved a custom background.
+_USER_BG_PNG = png_bytes()
+_USER_BG_DATA_URI = (
+    f"data:image/png;base64,{base64.b64encode(_USER_BG_PNG).decode('ascii')}"
+)
+
+_USER_BACKGROUND_PATH = "/index.php/apps/theming/background"
+
+
+def user_background_session(
+    payload: bytes | None = None, error: Exception | None = None
+) -> tuple[SimpleNamespace, list[str]]:
+    """A fake app-context session answering the per-user background
+    route: ``download2stream`` (the raw-download mechanism behind
+    ``nc.download_log``) serving ``payload`` or raising ``error``, plus
+    the requested paths for asserting the fetch pattern."""
+    requested: list[str] = []
+
+    def download2stream(url_path: str, fp) -> None:
+        requested.append(url_path)
+        if error is not None:
+            raise error
+        fp.write(payload)
+
+    return SimpleNamespace(download2stream=download2stream), requested
+
+
+def test_user_saved_background_overrides_the_instance_background(
+    monkeypatch, settings, caplog
+) -> None:
+    """A user who saved their own background (NC 35 appearance settings)
+    gets it on their deck: the resolution seam fetches it once per task
+    under the ambient impersonation and the render receives it as an
+    already-materialized data URI in place of the admin background URL,
+    while every other value stays instance-derived."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    session, requested = user_background_session(payload=_USER_BG_PNG)
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    nc._session = session
+    seen = capture_theming_render(monkeypatch)
+    with caplog.at_level("INFO", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={"prompt": "x", "theme": "nextcloud", "output_format": "html"},
+            ),
+            settings,
+        )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"] == SUCCESS_OUTPUT
+    values = seen["theming_values"]
+    assert isinstance(values, ThemingValues)
+    assert values.background == _USER_BG_DATA_URI
+    assert values.color == "#0082c9"
+    assert values.slogan == NC_THEMING_CAPS["slogan"]
+    # once per task (the memo), on exactly the per-user route
+    assert requested == [_USER_BACKGROUND_PATH]
+    assert any(
+        "task owner's saved background" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "INFO"
+    )
+
+
+def test_user_background_not_set_falls_back_to_instance_background(
+    monkeypatch, settings, caplog
+) -> None:
+    """404 from the theming route (the default: the user saved no custom
+    background) is a quiet DEBUG and the deck renders with exactly the
+    instance theming it always had."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    session, _requested = user_background_session(
+        error=NextcloudException(404, reason="No custom background")
+    )
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    nc._session = session
+    seen = capture_theming_render(monkeypatch)
+    with caplog.at_level("DEBUG", logger="marp_slides.theming"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={"prompt": "x", "theme": "nextcloud", "output_format": "html"},
+            ),
+            settings,
+        )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"] == SUCCESS_OUTPUT
+    assert seen["theming_values"] == ThemingValues.from_capabilities(NC_THEMING_CAPS)
+    assert any(
+        "not set (404)" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "DEBUG"
+    )
+
+
+def test_user_background_fetch_error_degrades_to_instance_background(
+    monkeypatch, settings, caplog
+) -> None:
+    """A transport failure on the user-background fetch can never fail
+    the task: one DEBUG with the reason, the instance background
+    applies, byte-comparable to a deck by a user without one."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    session, _requested = user_background_session(
+        error=RuntimeError("connection reset")
+    )
+    nc, api = make_fake_nc(capabilities={"theming": NC_THEMING_CAPS})
+    nc._session = session
+    seen = capture_theming_render(monkeypatch)
+    with caplog.at_level("DEBUG", logger="marp_slides.theming"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={"prompt": "x", "theme": "nextcloud", "output_format": "html"},
+            ),
+            settings,
+        )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"] == SUCCESS_OUTPUT
+    assert seen["theming_values"] == ThemingValues.from_capabilities(NC_THEMING_CAPS)
+    assert any(
+        "RuntimeError: connection reset" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "DEBUG"
     )
 
 
@@ -4806,3 +4952,161 @@ def test_custom_theme_pick_suppressed_by_the_off_switch(
         for r in caplog.records
     )
     assert b"theme: default" in api.uploads[1][1][1]
+
+
+# --- the per-deck background_file picker ------------------------------------------
+
+
+#: Distinct PNG bytes for the picked file, so the override is provable
+#: against the user's saved background (which serves _USER_BG_PNG).
+_PICKED_BG_PNG = png_bytes(120, 60)
+_PICKED_BG_DATA_URI = (
+    f"data:image/png;base64,{base64.b64encode(_PICKED_BG_PNG).decode('ascii')}"
+)
+
+PICKED_BACKGROUND_FILE_ID = 601
+
+
+def picked_background_files(
+    content: bytes = _PICKED_BG_PNG,
+    size: int | None = None,
+    mimetype: str = "image/png",
+) -> FakeFilesAPI:
+    """The task owner's Files with a background image node the picker
+    resolved (the id was access-checked server-side at schedule time)."""
+    return FakeFilesAPI(
+        nodes={
+            PICKED_BACKGROUND_FILE_ID: fake_node(
+                PICKED_BACKGROUND_FILE_ID, mimetype=mimetype, size=size
+            )
+        },
+        blobs={PICKED_BACKGROUND_FILE_ID: content},
+    )
+
+
+def test_picked_background_file_overrides_user_and_instance_background(
+    monkeypatch, settings, caplog
+) -> None:
+    """A picked ``background_file`` wins over BOTH layers beneath it:
+    the render carries the picked file's data URI even though the task
+    owner also has a saved background the seam could have used, and the
+    admin background URL the capabilities carried never surfaces."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    session, requested = user_background_session(payload=_USER_BG_PNG)
+    nc, api = make_fake_nc(
+        files=picked_background_files(),
+        capabilities={"theming": NC_THEMING_CAPS},
+    )
+    nc._session = session
+    seen = capture_theming_render(monkeypatch)
+    with caplog.at_level("INFO", logger="marp_slides.task_worker"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={
+                    "prompt": "x",
+                    "theme": "nextcloud",
+                    "output_format": "html",
+                    "background_file": PICKED_BACKGROUND_FILE_ID,
+                },
+            ),
+            settings,
+        )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"] == SUCCESS_OUTPUT
+    values = seen["theming_values"]
+    assert isinstance(values, ThemingValues)
+    assert values.background == _PICKED_BG_DATA_URI
+    # the pick short-circuits the user fetch entirely
+    assert requested == []
+    assert any(
+        "picked background_file" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "INFO"
+    )
+
+
+def test_unusable_picked_background_fails_soft_to_the_user_chain(
+    monkeypatch, settings, caplog
+) -> None:
+    """A pick whose bytes are not an image is one WARNING naming the
+    file, and the chain continues exactly as if nothing was picked:
+    here the task owner's saved background applies."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    session, _requested = user_background_session(payload=_USER_BG_PNG)
+    nc, api = make_fake_nc(
+        files=picked_background_files(
+            content=b"not an image at all", mimetype="text/plain"
+        ),
+        capabilities={"theming": NC_THEMING_CAPS},
+    )
+    nc._session = session
+    seen = capture_theming_render(monkeypatch)
+    with caplog.at_level("WARNING", logger="marp_slides.theming"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={
+                    "prompt": "x",
+                    "theme": "nextcloud",
+                    "output_format": "html",
+                    "background_file": PICKED_BACKGROUND_FILE_ID,
+                },
+            ),
+            settings,
+        )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"] == SUCCESS_OUTPUT
+    values = seen["theming_values"]
+    assert isinstance(values, ThemingValues)
+    assert values.background == _USER_BG_DATA_URI
+    assert any(
+        "not a usable image" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING"
+    )
+
+
+def test_oversize_picked_background_fails_soft_to_the_chain(
+    monkeypatch, settings, caplog
+) -> None:
+    """A picked file reporting past the raw-byte cap is skipped before
+    any download: one WARNING, and the instance background applies (no
+    user background saved on this owner)."""
+    fake, _calls = nc_deck_scheduler()
+    monkeypatch.setattr(task_worker, "schedule_and_wait", fake)
+    nc, api = make_fake_nc(
+        files=picked_background_files(size=BACKGROUND_MAX_BYTES + 1),
+        capabilities={"theming": NC_THEMING_CAPS},
+    )
+    seen = capture_theming_render(monkeypatch)
+    with caplog.at_level("WARNING", logger="marp_slides.theming"):
+        task_worker.process_task(
+            nc,
+            dict(
+                TASK,
+                input={
+                    "prompt": "x",
+                    "theme": "nextcloud",
+                    "output_format": "html",
+                    "background_file": PICKED_BACKGROUND_FILE_ID,
+                },
+            ),
+            settings,
+        )
+    (result,) = api.results
+    if result["output"] is not None:
+        assert result["output"] == SUCCESS_OUTPUT
+    assert seen["theming_values"] == ThemingValues.from_capabilities(NC_THEMING_CAPS)
+    assert nc.files.downloaded == []
+    assert any(
+        "is ignored" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING"
+    )

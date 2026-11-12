@@ -45,6 +45,7 @@ def test_provider_shape() -> None:
         "theme",
         "tokens_file",
         "custom_theme_file",
+        "background_file",
         "max_slides",
         "draft_id",
         "draft_file",
@@ -55,6 +56,7 @@ def test_provider_shape() -> None:
         theme_slot,
         tokens_file_slot,
         custom_theme_file_slot,
+        background_file_slot,
         _max_slides,
         _draft,
         _draft_file,
@@ -80,6 +82,7 @@ def test_provider_shape() -> None:
     assert theme_slot.shape_type == ShapeType.ENUM
     assert tokens_file_slot.shape_type == ShapeType.FILE
     assert custom_theme_file_slot.shape_type == ShapeType.FILE
+    assert background_file_slot.shape_type == ShapeType.FILE
     assert images_slot.shape_type == ShapeType.LIST_OF_FILES
 
 
@@ -164,6 +167,23 @@ def test_custom_theme_file_slot_is_optional_file_with_override_teaching() -> Non
     ]
 
 
+def test_background_file_slot_is_optional_file_with_override_teaching() -> None:
+    """The per-deck background entry: the label teaches the two layers
+    the pick overrides (the user's saved background, the instance
+    branding) and the one-deck scope; like every picker it stays a
+    generation-task concern."""
+    provider = task_definition.PROVIDER
+    slot = next(s for s in provider.optional_input_shape if s.name == "background_file")
+    assert slot.shape_type == ShapeType.FILE
+    assert slot.description == (
+        "Optional: pick a background image for this deck. Overrides "
+        "your saved background and the instance branding."
+    )
+    assert "background_file" not in [
+        s.name for s in task_definition.RE_RENDER_PROVIDER.optional_input_shape
+    ]
+
+
 def test_theme_description_states_values_and_pptx_limit() -> None:
     provider = task_definition.PROVIDER
     theme_slot = next(s for s in provider.optional_input_shape if s.name == "theme")
@@ -178,9 +198,17 @@ def test_theme_description_states_values_and_pptx_limit() -> None:
 
 def test_draft_id_slot_is_optional_text_with_resume_teaching() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, _theme, _tokens, _theme_file, _ms, draft_slot, _draft_file, _images) = (
-        provider.optional_input_shape
-    )
+    (
+        _fmt,
+        _theme,
+        _tokens,
+        _theme_file,
+        _background,
+        _ms,
+        draft_slot,
+        _draft_file,
+        _images,
+    ) = provider.optional_input_shape
     assert draft_slot.name == "draft_id"
     assert draft_slot.shape_type == ShapeType.TEXT
     assert "12-character draft id" in draft_slot.description
@@ -199,9 +227,17 @@ def test_draft_file_slot_is_optional_file_with_resume_teaching() -> None:
     the id comes from (the header comment) and what resumes (the completed
     slides)."""
     provider = task_definition.PROVIDER
-    (_fmt, _theme, _tokens, _theme_file, _ms, _draft, draft_file_slot, _images) = (
-        provider.optional_input_shape
-    )
+    (
+        _fmt,
+        _theme,
+        _tokens,
+        _theme_file,
+        _background,
+        _ms,
+        _draft,
+        draft_file_slot,
+        _images,
+    ) = provider.optional_input_shape
     assert draft_file_slot.name == "draft_file"
     assert draft_file_slot.shape_type == ShapeType.FILE
     assert "draft .md" in draft_file_slot.description
@@ -215,9 +251,17 @@ def test_draft_file_slot_is_optional_file_with_resume_teaching() -> None:
 
 def test_enum_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
-    (fmt, _theme, _tokens, _theme_file, _ms, _draft, _draft_file, _images) = (
-        provider.optional_input_shape
-    )
+    (
+        fmt,
+        _theme,
+        _tokens,
+        _theme_file,
+        _background,
+        _ms,
+        _draft,
+        _draft_file,
+        _images,
+    ) = provider.optional_input_shape
     # one short human sentence: the dropdown options already enumerate the
     # formats, so the label only states the purpose and the default. The
     # GENERATION default is 'all'; the re-render task keeps its own 'pptx'
@@ -229,9 +273,17 @@ def test_enum_description_is_one_clean_sentence() -> None:
 
 def test_images_slot_description_is_one_clean_sentence() -> None:
     provider = task_definition.PROVIDER
-    (_fmt, _theme, _tokens, _theme_file, _ms, _draft, _draft_file, images_slot) = (
-        provider.optional_input_shape
-    )
+    (
+        _fmt,
+        _theme,
+        _tokens,
+        _theme_file,
+        _background,
+        _ms,
+        _draft,
+        _draft_file,
+        images_slot,
+    ) = provider.optional_input_shape
     assert images_slot.description == (
         "Optional images to place in the deck (PNG, JPEG or WebP, "
         "max 5 MB each; SVG is not supported)."

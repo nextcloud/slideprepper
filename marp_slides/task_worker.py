@@ -249,7 +249,12 @@ from .settings import (
     Settings,
     apply_admin_config,
 )
-from .theming import THEME_NAME, ThemingValues
+from .theming import (
+    THEME_NAME,
+    ThemingValues,
+    fetch_user_background_data_uri,
+    read_background_by_id,
+)
 
 LOGGER = logging.getLogger("marp_slides.task_worker")
 
@@ -1863,10 +1868,12 @@ def _optional_file_input_id(raw: object, slot: str) -> int | None:
 
 def _seed_branding_file_inputs(task_input: Mapping[str, Any], task_id: int) -> None:
     """Seed the per-task branding overrides from the optional
-    ``tokens_file`` / ``custom_theme_file`` inputs: the picked ids ride
-    the resolution seams for this task only (see
-    :func:`_resolve_task_tokens` / :func:`_resolve_task_custom_theme`
-    for the precedence and fail-soft chain)."""
+    ``tokens_file`` / ``custom_theme_file`` / ``background_file``
+    inputs: the picked ids ride the resolution seams for this task only
+    (see :func:`_resolve_task_tokens` /
+    :func:`_resolve_task_custom_theme` /
+    :func:`_resolve_task_background` for the precedence and fail-soft
+    chain)."""
     tokens_file = _optional_file_input_id(task_input.get("tokens_file"), "tokens_file")
     if tokens_file is not None:
         _TASK_TOKENS_FILE_IDS[task_id] = tokens_file
@@ -1875,6 +1882,11 @@ def _seed_branding_file_inputs(task_input: Mapping[str, Any], task_id: int) -> N
     )
     if theme_file is not None:
         _TASK_CUSTOM_THEME_FILE_IDS[task_id] = theme_file
+    background_file = _optional_file_input_id(
+        task_input.get("background_file"), "background_file"
+    )
+    if background_file is not None:
+        _TASK_BACKGROUND_FILE_IDS[task_id] = background_file
 
 
 def _download_text_file(
@@ -2103,15 +2115,17 @@ def _re_render_deck(
 
 
 #: The per-task branding file-picker overrides (the optional
-#: ``tokens_file`` / ``custom_theme_file`` task inputs): task_id -> the
-#: picked file id. Seeded once per GENERATION task by
-#: :func:`_generate_deck` (the one place the task input is in hand;
-#: the re-render task keeps the conventional-path resolution only) and
-#: consulted by the resolution seams, which otherwise re-resolve per
-#: slide measurement and render. Cleared at every task boundary like the
-#: memos: the worker loop is sequential, so one slot per task is exact.
+#: ``tokens_file`` / ``custom_theme_file`` / ``background_file`` task
+#: inputs): task_id -> the picked file id. Seeded once per GENERATION
+#: task by :func:`_generate_deck` (the one place the task input is in
+#: hand; the re-render task keeps the conventional-path resolution
+#: only) and consulted by the resolution seams, which otherwise
+#: re-resolve per slide measurement and render. Cleared at every task
+#: boundary like the memos: the worker loop is sequential, so one slot
+#: per task is exact.
 _TASK_TOKENS_FILE_IDS: dict[int, int] = {}
 _TASK_CUSTOM_THEME_FILE_IDS: dict[int, int] = {}
+_TASK_BACKGROUND_FILE_IDS: dict[int, int] = {}
 
 #: The per-task design-tokens memo: ``(task_id, tokens_path)`` -> the
 #: resolved tokens and the label naming the file they came from (None =
@@ -2176,6 +2190,63 @@ def _resolve_task_tokens(
     return read_design_tokens(nc, tokens_path), tokens_path
 
 
+#: The per-task background memo: task_id -> the deck's overriding
+#: background as an already-materialized ``data:`` URI, or None (no
+#: override; the background the capabilities carried renders). Like the
+#: design tokens memo, the override source is read ONCE per task (one
+#: user-background fetch, one consistent background across every gate
+#: and render; a background changed mid-task cannot split the deck
+#: between two images), and :func:`process_task` clears it at every
+#: task boundary.
+_TASK_BACKGROUND_MEMO: dict[int, str | None] = {}
+
+
+def _task_background_data_uri(nc: NextcloudApp, task_id: int) -> str | None:
+    """The deck's overriding background image (the task owner's saved
+    custom background) as a materialized data URI, resolved ONCE per
+    task: the first caller pays the fetch, every later resolution of
+    the same task reuses the result. Never raises
+    (:func:`fetch_user_background_data_uri` is fail-soft by contract)."""
+    if task_id not in _TASK_BACKGROUND_MEMO:
+        _TASK_BACKGROUND_MEMO[task_id] = _resolve_task_background(nc, task_id)
+    return _TASK_BACKGROUND_MEMO[task_id]
+
+
+def _resolve_task_background(nc: NextcloudApp, task_id: int) -> str | None:
+    """The background precedence under the task owner's own choices: a
+    picked ``background_file`` input wins while its bytes are a usable
+    image (an unusable pick is one WARNING from the reader and the
+    chain continues), then the owner's SAVED custom background (NC 35
+    appearance settings, fetched under the task's ambient
+    impersonation) overrides the instance background; a user with
+    neither keeps exactly today's behavior. None on any failure (a
+    branding image can never fail a task), letting the instance
+    background apply."""
+    picked_id = _TASK_BACKGROUND_FILE_IDS.get(task_id)
+    if picked_id is not None:
+        data_uri, label = read_background_by_id(nc, picked_id)
+        if data_uri is not None:
+            LOGGER.info(
+                "Task %s: nextcloud theme uses the picked background_file '%s'",
+                task_id,
+                label,
+            )
+            return data_uri
+        LOGGER.info(
+            "Task %s: the picked background_file (file id %s) was not "
+            "usable; the saved user or instance background applies",
+            task_id,
+            picked_id,
+        )
+    data_uri = fetch_user_background_data_uri(nc)
+    if data_uri is not None:
+        LOGGER.info(
+            "Task %s: nextcloud theme uses the task owner's saved background",
+            task_id,
+        )
+    return data_uri
+
+
 def _resolve_theming_values(
     nc: NextcloudApp, task_id: int, tokens_path: str = DEFAULT_DESIGN_TOKENS_PATH
 ) -> ThemingValues:
@@ -2200,7 +2271,18 @@ def _resolve_theming_values(
     (missing file: DEBUG and today's behavior; malformed file: one
     WARNING naming the file per task; neither ever fails the task), so
     the log lines below only fire when the instance theming actually
-    applies."""
+    applies.
+
+    Before the tokens overlay, the BACKGROUND is resolved at the
+    per-deck precedence (:func:`_task_background_data_uri`): a picked
+    ``background_file`` input first, then the task owner's saved custom
+    background (fetched once per task under the ambient impersonation),
+    overriding the instance background URL the capabilities carried, as
+    an already-materialized ``data:`` URI that renders without a second
+    fetch. Fail-soft (a WARNING for an unusable pick, a DEBUG for the
+    saved-background degradations), never a task failure. The overlay
+    runs AFTER this seam, so a tokens file keeps replacing the
+    background exactly as before."""
     try:
         theming = nc.capabilities.get("theming") or {}
     except Exception as exc:  # noqa: BLE001 - a theming issue must never fail a task
@@ -2212,6 +2294,9 @@ def _resolve_theming_values(
         )
         theming = {}
     values = ThemingValues.from_capabilities(theming)
+    background_data_uri = _task_background_data_uri(nc, task_id)
+    if background_data_uri is not None:
+        values = replace(values, background=background_data_uri)
     tokens, tokens_label = _task_design_tokens(nc, task_id, tokens_path)
     if tokens is not None:
         values = tokens.overlay(values)
@@ -2906,6 +2991,8 @@ def process_task(nc: NextcloudApp, task: Mapping[str, Any], settings: Settings) 
     _CUSTOM_THEME_MEMO.clear()
     _TASK_TOKENS_FILE_IDS.clear()
     _TASK_CUSTOM_THEME_FILE_IDS.clear()
+    _TASK_BACKGROUND_FILE_IDS.clear()
+    _TASK_BACKGROUND_MEMO.clear()
     markdown: str | None = None
     drafts = _DraftSession(enabled=settings.drafts_enabled, task_id=task_id)
     user_id: str | None = None
