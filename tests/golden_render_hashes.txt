@@ -1,9 +1,11 @@
 # Golden-render SHA-256 pins (Typst-style 32-byte pins; the
 # rendered artifacts themselves are NOT committed).
 #
-# Provenance the pins were generated under; a running marp that
-# differs skips the pin comparison (byte-identity still gates):
+# Provenance the pins were generated under; a running marp or
+# host platform that differs skips the pin comparison
+# (byte-identity still gates):
 # marp: @marp-team/marp-cli v4.5.1 (w/ @marp-team/marp-core v4.4.0)
+# platform: debian-amd64
 #
 # Update path (deliberate action, never automatic):
 #   SLIDEPREPPER_UPDATE_GOLDEN_HASHES=1 pytest -m battery tests/test_golden_render.py

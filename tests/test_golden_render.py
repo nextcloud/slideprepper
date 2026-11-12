@@ -24,10 +24,17 @@ Pinned findings this matrix re-proves on every run:
   normalized away.
 
 Hash pins are environment-bound by nature: they hold for the exact
-marp-cli recorded in the hashes file's provenance header. When the
-running ``marp --version`` differs, the byte-identity assertions still
-run and gate, and only the pin comparison is skipped, with a reason
-naming the recorded and running versions.
+marp-cli AND host platform recorded in the hashes file's provenance
+header (rendered bytes are platform-bound: the OS font stack sits
+under marp's Chromium, so the same deck under the same marp differs
+between Debian and Ubuntu, which is how the first CI battery run
+failed every pin with matching versions). When the running ``marp
+--version`` or ``platform_id()`` differs, the byte-identity
+assertions still run and gate, and only the pin comparison is
+skipped, with a reason naming the recorded and running values. The
+file format and those comparability rules live in
+``tests/golden_hashes.py`` and are pinned hermetically by
+``tests/test_golden_hashes.py`` in the default suite.
 
 Workflow::
 
@@ -65,23 +72,12 @@ from marp_slides.deck_pipeline import DeckError, marp_html_gate
 from marp_slides.deck_pipeline import render_deck_html as pipeline_render_html
 from marp_slides.deck_pipeline import render_deck_pdf as pipeline_render_pdf
 from marp_slides.validator import validate_deck
+from tests import golden_hashes as gh
 
 pytestmark = pytest.mark.battery
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "fixtures"
-HASHES_FILE = Path(__file__).resolve().parent / "golden_render_hashes.txt"
-
-#: Every committed canonical deck: the read-only fixtures directory.
-GOLDEN_DECKS = (
-    "deck",
-    "deck-code-audit",
-    "deck-constructs",
-    "deck-directives",
-    "deck-images",
-)
-FORMATS = ("html", "pdf", "pptx")
-UPDATE_ENV = "SLIDEPREPPER_UPDATE_GOLDEN_HASHES"
 
 _RENDER_CACHE: dict[tuple[str, str], tuple[bytes, bytes]] = {}
 _PINS_REBUILT = False
@@ -180,97 +176,61 @@ def _marp_version() -> str | None:
     return result.stdout.decode("utf-8", errors="replace").strip() or None
 
 
-def _parse_pins() -> tuple[dict[tuple[str, str], str], str | None]:
-    """(pins, recorded marp version) from the committed hashes file."""
-    pins: dict[tuple[str, str], str] = {}
-    marp: str | None = None
-    for raw_line in HASHES_FILE.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            if line.startswith("# marp:"):
-                marp = line.removeprefix("# marp:").strip()
-            continue
-        deck_file, fmt, digest = line.split()
-        pins[(deck_file.removesuffix(".md"), fmt)] = digest
-    return pins, marp
-
-
-def _write_pins(pins: dict[tuple[str, str], str], marp_version: str | None) -> None:
-    lines = [
-        "# Golden-render SHA-256 pins (Typst-style 32-byte pins; the",
-        "# rendered artifacts themselves are NOT committed).",
-        "#",
-        "# Provenance the pins were generated under; a running marp that",
-        "# differs skips the pin comparison (byte-identity still gates):",
-        f"# marp: {marp_version}",
-        "#",
-        "# Update path (deliberate action, never automatic):",
-        f"#   {UPDATE_ENV}=1 pytest -m battery tests/test_golden_render.py",
-        "# (fails once by design: review the diff, commit this file, re-run)",
-    ]
-    for deck in GOLDEN_DECKS:
-        lines.extend(
-            f"{deck}.md {fmt} {pins[(deck, fmt)]}"
-            for fmt in FORMATS
-            if (deck, fmt) in pins
-        )
-    HASHES_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def _rebuild_pins() -> dict[tuple[str, str], str]:
     pins: dict[tuple[str, str], str] = {}
-    for deck in GOLDEN_DECKS:
-        for fmt in FORMATS:
+    for deck in gh.GOLDEN_DECKS:
+        for fmt in gh.FORMATS:
             artifact, _ = _render_twice(deck, fmt)
             pins[(deck, fmt)] = hashlib.sha256(artifact).hexdigest()
-    _write_pins(pins, _marp_version())
+    gh.write_pins(gh.HASHES_FILE, pins, _marp_version(), gh.platform_id())
     return pins
 
 
 def _check_pin(deck: str, fmt: str, artifact: bytes) -> None:
     global _PINS_REBUILT  # noqa: PLW0603 - session-once update flag
-    if os.environ.get(UPDATE_ENV) == "1":
+    if os.environ.get(gh.UPDATE_ENV) == "1":
         if not _PINS_REBUILT:
             _rebuild_pins()  # renders the full matrix once, then rewrites
             _PINS_REBUILT = True
         pytest.fail(
             f"Golden hashes for tests/golden_render_hashes.txt were "
-            f"REGENERATED under marp {_marp_version()}. Review the diff, "
-            f"commit the file, and re-run without {UPDATE_ENV}=1."
+            f"REGENERATED under marp {_marp_version()} on platform "
+            f"{gh.platform_id()}. Review the diff, commit the file, and "
+            f"re-run without {gh.UPDATE_ENV}=1."
         )
-    if not HASHES_FILE.exists():
+    if not gh.HASHES_FILE.exists():
         pytest.fail(
-            f"{HASHES_FILE.name} is missing; generate it with "
-            f"{UPDATE_ENV}=1 pytest -m battery tests/test_golden_render.py"
+            f"{gh.HASHES_FILE.name} is missing; generate it with "
+            f"{gh.UPDATE_ENV}=1 pytest -m battery tests/test_golden_render.py"
         )
-    pins, recorded_marp = _parse_pins()
-    live_marp = _marp_version()
-    if recorded_marp != live_marp:
-        pytest.skip(
-            f"hash pin skipped: running marp '{live_marp}' != pinned "
-            f"'{recorded_marp}'. Byte-identity still gated above. Re-pin "
-            f"under the pinned toolchain with {UPDATE_ENV}=1 if this "
-            "toolchain is the new reference."
-        )
+    pins, provenance = gh.parse_pins(gh.HASHES_FILE.read_text(encoding="utf-8"))
+    reason = gh.provenance_skip_reason(
+        provenance["marp"],
+        provenance["platform"],
+        _marp_version(),
+        gh.platform_id(),
+    )
+    if reason is not None:
+        pytest.skip(reason)
     key = (deck, fmt)
     if key not in pins:
         pytest.fail(
-            f"No pin recorded for {deck}.md {fmt} in {HASHES_FILE.name}; "
-            f"regenerate with {UPDATE_ENV}=1."
+            f"No pin recorded for {deck}.md {fmt} in {gh.HASHES_FILE.name}; "
+            f"regenerate with {gh.UPDATE_ENV}=1."
         )
     digest = hashlib.sha256(artifact).hexdigest()
     assert digest == pins[key], (
         f"Golden {fmt} render of fixtures/{deck}.md changed: sha256 "
         f"{digest} != pinned {pins[key]}. If the change is deliberate, "
-        f"re-pin with {UPDATE_ENV}=1 and review the artifact diff first."
+        f"re-pin with {gh.UPDATE_ENV}=1 and review the artifact diff first."
     )
 
 
 # --- the gate ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fmt", FORMATS)
-@pytest.mark.parametrize("deck", GOLDEN_DECKS)
+@pytest.mark.parametrize("fmt", gh.FORMATS)
+@pytest.mark.parametrize("deck", gh.GOLDEN_DECKS)
 def test_golden_render_byte_stable_and_pinned(deck: str, fmt: str) -> None:
     if shutil.which("marp") is None:
         pytest.skip(
@@ -282,7 +242,7 @@ def test_golden_render_byte_stable_and_pinned(deck: str, fmt: str) -> None:
     _check_pin(deck, fmt, first)
 
 
-@pytest.mark.parametrize("deck", GOLDEN_DECKS)
+@pytest.mark.parametrize("deck", gh.GOLDEN_DECKS)
 def test_golden_pptx_opens_in_python_pptx(deck: str) -> None:
     """The normalized golden PPTX still parses in a real consumer, with
     the fixture deck's slide count."""
