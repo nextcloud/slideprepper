@@ -166,7 +166,7 @@ jobs:
       # monospace fidelity is required only under the Collabora engine, so
       # the headless impress install is sufficient here.
       - name: Install LibreOffice for the nightly smoke
-        run: sudo apt-get update && sudo apt-get install -y libreoffice-impress
+        run: sudo apt-get update && sudo apt-get install -y libreoffice-impress poppler-utils
       - name: Nightly lane (pytest -m nightly; exit 5 = lane empty, still green)
         run: |
           set +e
