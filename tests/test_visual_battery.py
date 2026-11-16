@@ -9,7 +9,11 @@ Four guards, cheapest first:
 2. two independent renders are byte-identical (the determinism the zero
    diff budget depends on; catches a flaky renderer before it is diffed);
 3. every slide of the canonical baseline deck matches its committed PNG
-   inside the pinned diff budget (zero diff pixels above tolerance);
+   inside the pinned diff budget (zero diff pixels above tolerance), a
+   comparison that runs only on the platform recorded in the metadata:
+   rendered pixels are platform-bound (the OS font stack under marp's
+   Chromium), so any other platform skips with an explicit reason while
+   guard 2 (determinism) still gates everywhere;
 4. the measured per-slide pixel budgets of every canonical deck never
    regress against the committed ratchet file.
 
@@ -69,6 +73,19 @@ def test_render_is_byte_deterministic(tmp_path: Path) -> None:
 
 def test_slides_match_baselines(tmp_path: Path) -> None:
     metadata = vb.read_metadata()
+    render_pins = metadata.get("render")
+    if not isinstance(render_pins, dict):
+        pytest.fail(
+            "metadata.json carries no render pins — regenerate with "
+            "scripts/battery_update.py --baselines."
+        )
+    recorded_platform = render_pins.get("platform")
+    platform_reason = vb.platform_skip_reason(
+        str(recorded_platform) if recorded_platform is not None else None,
+        vb.platform_id(),
+    )
+    if platform_reason is not None:
+        pytest.skip(platform_reason)
     deck_name = str(metadata["deck"])
     markdown = vb.canonical_decks()[deck_name]
     slides = vb.render_slides(markdown, vb.battery_workdir(tmp_path) / "baseline")
@@ -85,8 +102,6 @@ def test_slides_match_baselines(tmp_path: Path) -> None:
     )
     diff_policy = metadata["diff"]
     assert isinstance(diff_policy, dict)
-    render_pins = metadata["render"]
-    assert isinstance(render_pins, dict)
     tolerance = int(diff_policy["channel_tolerance"])
     max_pixels = int(diff_policy["max_diff_pixels"])
     window_px = int(diff_policy["dense_window_px"])

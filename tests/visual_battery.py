@@ -29,6 +29,13 @@ Design, in one breath (grounded in the wave research):
   re-renders and rewrites both the PNGs and the environment pins in
   ``metadata.json``: baselines are environment-relative by construction
   (the Playwright same-environment rule), so the pins travel with them.
+  The pins include the host platform (distro-arch, the same identifier the
+  golden-render pins use): rendered pixels are platform-bound, because the
+  OS font stack under marp's Chromium antialiases differently per distro,
+  so the pixel comparison runs only on the platform that produced the
+  baselines and skips with an explicit reason everywhere else, while the
+  determinism proof (render twice, compare within one run) still gates in
+  every environment.
 - The overflow-budget ratchet stores per-slide pixel budgets as data
   (``budgets.json``): lower-is-better overflow series and a
   higher-is-better fit-margin series, each ratcheting monotonically. The
@@ -50,6 +57,7 @@ from pathlib import Path
 from PIL import Image, ImageChops
 
 from marp_slides import marp_cli
+from tests.golden_hashes import platform_id
 
 #: Battery data root: canonical decks, committed baselines, budgets.
 DATA_DIR = Path(__file__).resolve().parent / "battery"
@@ -153,6 +161,44 @@ def environment_mismatches(
                     "it here with scripts/battery_update.py --baselines --budgets."
                 )
     return problems
+
+
+def platform_skip_reason(
+    recorded_platform: str | None, live_platform: str
+) -> str | None:
+    """Why the committed baselines cannot be pixel-diffed in this
+    environment, or None when they can (the recorded platform matches).
+
+    The platform is the one dimension the version pins deliberately do
+    NOT cover: matching marp and Chromium versions still render
+    different pixels across distros (the OS font stack under marp's
+    Chromium), which is how the first CI battery run failed the pixel
+    comparison with ~8000 diff pixels on identical versions. A mismatch
+    skips the baseline comparison; determinism is not part of this
+    decision, it gates in every environment, so a skip never weakens
+    the renderer proof, only the cross-platform unstable pin that is
+    only meaningful on the generating platform anyway.
+    """
+    if recorded_platform is None:
+        return (
+            "baseline comparison skipped: metadata.json predates platform "
+            "provenance, so the host its PNGs were rendered on is unknown. "
+            "Determinism still gated separately. Regenerate with "
+            "scripts/battery_update.py --baselines on the reference "
+            "platform."
+        )
+    if recorded_platform != live_platform:
+        return (
+            f"baseline comparison skipped: running platform '{live_platform}' "
+            f"!= pinned '{recorded_platform}'. Determinism still gated "
+            "separately. Rendered pixels are platform-bound (the OS font "
+            "stack under marp's Chromium antialiases per distro), so "
+            "baselines compare only on the platform that produced them; "
+            "CI comparison needs baselines generated on the runner, or "
+            "regenerate with scripts/battery_update.py --baselines if this "
+            "platform is the new reference."
+        )
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -436,6 +482,7 @@ def update_baselines(workdir: Path) -> list[str]:
             "schema": 1,
             "deck": deck_name,
             "render": {
+                "platform": platform_id(),
                 "marp_cli_version": marp_version(),
                 "chrome_version": chrome_version(),
                 "image_scale": IMAGE_SCALE,
